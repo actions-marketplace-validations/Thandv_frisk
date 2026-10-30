@@ -26,6 +26,7 @@ import json
 import subprocess
 import sys
 import threading
+from typing import TextIO
 
 from .engine import scan_text, worst_severity
 
@@ -39,7 +40,7 @@ def _tool_text(tool: dict) -> str:
 
 
 class Proxy:
-    def __init__(self, server_cmd: list[str], log=sys.stderr):
+    def __init__(self, server_cmd: list[str], log: TextIO = sys.stderr):
         self.server_cmd = server_cmd
         self.log = log
         self.pins: dict[str, str] = {}          # tool name -> description hash
@@ -67,7 +68,7 @@ class Proxy:
             changed = name in self.pins and self.pins[name] != h
             self.pins[name] = h
 
-            findings = scan_text(_tool_text(tool), name)
+            findings = scan_text(_tool_text(tool), name).findings
             sev = worst_severity(findings)
 
             if sev == "block":
@@ -90,7 +91,7 @@ class Proxy:
     def _scan_content(self, content: list) -> None:
         for item in content:
             if item.get("type") == "text" and isinstance(item.get("text"), str):
-                findings = scan_text(item["text"], "tool-result")
+                findings = scan_text(item["text"], "tool-result").findings
                 if worst_severity(findings) == "block":
                     self.stats["flagged"] += 1
                     self._log(f"injection in tool result: {findings[0].description}")
@@ -127,12 +128,15 @@ class Proxy:
             try:
                 msg = json.loads(line)
             except json.JSONDecodeError:
-                sys.stdout.write(line + "\n"); sys.stdout.flush(); continue
+                sys.stdout.write(line + "\n")
+                sys.stdout.flush()
+                continue
             try:
                 msg = self.inspect(msg)
             except Exception as e:  # noqa: BLE001 — never let inspection break the stream
                 self._log(f"inspect error (passing through): {e}")
-            sys.stdout.write(json.dumps(msg) + "\n"); sys.stdout.flush()
+            sys.stdout.write(json.dumps(msg) + "\n")
+            sys.stdout.flush()
 
         code = proc.wait()
         self._log(f"server exited ({code}); dropped={self.stats['dropped']} "

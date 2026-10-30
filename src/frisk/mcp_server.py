@@ -56,13 +56,13 @@ def _advice(v: str) -> str:
 
 def _scan_source(source: str) -> str:
     with materialize(source) as (root, _):
-        findings = scan_path(root, root if root.is_dir() else None)
+        findings = scan_path(root, root if root.is_dir() else None).findings
     return _summary(findings, source)
 
 
 TOOLS = {
     "scan_text": (
-        lambda text: _summary(scan_text(text, "<text>"), "<text>"),
+        lambda text: _summary(scan_text(text, "<text>").findings, "<text>"),
         "Vet a raw string (e.g. an MCP tool description, skill body, or prompt) for "
         "prompt-injection, tool-poisoning, and hidden/invisible-unicode instructions.",
         {"text": {"type": "string"}}, ["text"],
@@ -88,8 +88,9 @@ def _tools_list():
             for n, (_, d, props, req) in TOOLS.items()]
 
 
-def handle(req: dict):
-    m = req.get("method"); rid = req.get("id")
+def handle(req: dict) -> dict | None:
+    m = req.get("method")
+    rid = req.get("id")
     if m == "initialize":
         return {"jsonrpc": "2.0", "id": rid, "result": {
             "protocolVersion": PROTOCOL,
@@ -99,7 +100,8 @@ def handle(req: dict):
         return {"jsonrpc": "2.0", "id": rid, "result": {"tools": _tools_list()}}
     if m == "tools/call":
         p = req.get("params", {})
-        name = p.get("name"); args = p.get("arguments", {})
+        name = p.get("name")
+        args = p.get("arguments", {})
         try:
             text = str(TOOLS[name][0](**args))
             return {"jsonrpc": "2.0", "id": rid,
@@ -114,7 +116,7 @@ def handle(req: dict):
             "error": {"code": -32601, "message": f"method not found: {m}"}}
 
 
-def main():
+def main() -> None:
     for line in sys.stdin:
         line = line.strip()
         if not line:
