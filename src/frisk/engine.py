@@ -1,24 +1,50 @@
 """Static scan engine. Zero-execution: reads bytes, matches regex, returns findings."""
 from __future__ import annotations
 
+import codecs
 import os
 import posixpath
 import re
+import stat
+import time
 from bisect import bisect_right
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 
-from . import surfaces
+from . import surfaces, walk
+from .debug import log as _root_log
+from .redact import Redactor
 from .rules import (
-    ARCHIVE_EXTS, CODE_EXTS, CODE_RULES, EXECUTABLE_EXTS, MEDIA_EXTS, OPAQUE_DATA_EXTS, RULE_META,
-    TEXT_EXTS, TEXT_RULES, UNICODE_RULE, executable_magic, hidden_unicode,
+    ARCHIVE_EXTS, CODE_EXTS, CODE_RULES, CONTEXTS, EXECUTABLE_EXTS, MEDIA_EXTS, OPAQUE_DATA_EXTS, PROSE_RULES,
+    RULE_META, INSTRUCTION_RULES, TEXT_EXTS, TEXT_RULES, executable_magic, hidden_unicode,
 )
+from .sources import materialize
 from .surfaces import Span
+
+log = _root_log.getChild("engine")
 
 _NEWLINE = re.compile("\n")
 
+# Scan bounds (ScanLimits' defaults). A file larger than MAX_FILE_BYTES is not read; a text
+# longer than MAX_FILE_BYTES characters is matched in a head and a tail window (scan_text).
+MAX_FILES = 20_000
+MAX_FILE_BYTES = 2 * 1024 * 1024
+
 SEVERITY_ORDER = {None: 0, "warn": 1, "block": 2}
 _INTERNAL_FIELDS = ("origin", "source_line")
+
+
+@dataclass(frozen=True)
+class ScanLimits:
+    """Bounds on one scan_path call. A file over max_file_bytes is not read (reason
+    too_large, a coverage.too_large block finding). The walk stops before the next file once
+    max_files files were looked at, max_bytes bytes were read, or deadline_s seconds have
+    passed (file_cap, byte_cap, deadline: a coverage.unscanned warning). So the verdict is
+    never PASS."""
+    max_files: int = MAX_FILES
+    max_file_bytes: int = MAX_FILE_BYTES
+    max_bytes: int | None = None
+    deadline_s: float | None = None
 
 
 @dataclass
@@ -89,75 +115,153 @@ def _line_starts(text: str) -> list[int]:
     return [0] + [m.end() for m in _NEWLINE.finditer(text)]
 
 
-def _excerpt(text: str, idx: int, span: int = 80) -> str:
-    start = max(0, idx - 10)
-    snippet = text[start:idx + span].replace("\n", "\\n")
+def _excerpt(secrets: Redactor, lo: int, hi: int, idx: int, after: int = 80) -> str:
+    """The text around offset `idx` (10 characters before, `after` from it), inside [lo, hi),
+    with its secrets masked."""
+    snippet = secrets.window(max(lo, idx - 10), min(hi, idx + after)).replace("\n", "\\n")
     return snippet.strip()[:120]
 
 
-def _scan_span(text: str, span: Span, starts: list[int], rel: str, out: list[Finding]) -> None:
-    """Run the span's rules on text[span.start:span.end]; lines are file lines.
+# Kinds with their own rules; every other kind is a text kind: TEXT_RULES and the hidden-
+# Unicode check. scan_text runs the rules of its context ("context:<name>") and, as its own
+# span, the hidden-Unicode check ("unicode") on the whole text.
+_RULES_FOR_KIND = {"code": CODE_RULES, "md_inline_code": CODE_RULES, "instruction": INSTRUCTION_RULES,
+                   "unicode": [],
+                   **{f"context:{c}": [r for r in CODE_RULES + TEXT_RULES + INSTRUCTION_RULES + PROSE_RULES
+                                       if c in r[5]] for c in CONTEXTS}}
+_WARN_CAPPED_KINDS = {"md_inline_code"}  # a block finding from these spans reports as warn
+
+
+def _scan_span(text: str, span: Span, starts: list[int], rel: str, out: list[Finding],
+               seen: set[tuple[int, str]], on_line: set[tuple[int, str]], secrets: Redactor) -> None:
+    """Run the span's rules on text[span.start:span.end] (or on span.text, when the span
+    carries its content); lines are file lines.
 
     The span is matched as its own string (so ^, lookbehinds and word boundaries see the
     span's edges, as they always have) and its excerpts stay inside it; offsets are
-    shifted by span.start and mapped to a line through the file's line index.
+    shifted by span.start and mapped to a line through the file's line index. A rule that
+    matched at the same file offset in an earlier, overlapping span is reported once.
+    A span with its own text reports every finding at span.start's line, and not at all
+    where that line already has a finding of the same rule.
     """
-    seg = text if (span.start, span.end) == (0, len(text)) else text[span.start:span.end]
+    decoded = span.text is not None
+    if span.text is not None:
+        seg, lo, hi, shift, words = span.text, 0, len(span.text), 0, Redactor(span.text)
+    else:
+        seg = text if (span.start, span.end) == (0, len(text)) else text[span.start:span.end]
+        lo, hi, shift, words = span.start, span.end, span.start, secrets
 
     def add(idx: int, rid: str, cat: str, sev: str, desc: str, excerpt: str) -> None:
-        line = bisect_right(starts, span.start + idx)
+        at = span.start if decoded else span.start + idx
+        line = bisect_right(starts, at)
+        if ((line, rid) in on_line) if decoded else ((at, rid) in seen):
+            return
+        seen.add((at, rid))
+        on_line.add((line, rid))
         end = starts[line] - 1 if line < len(starts) else len(text)
         out.append(Finding(rel, line, rid, cat, sev, desc, excerpt,
                            source_line=text[starts[line - 1]:end]))
 
-    for rid, cat, sev, rx, desc in (CODE_RULES if span.kind == "code" else TEXT_RULES):
+    capped = span.kind in _WARN_CAPPED_KINDS
+    for rid, cat, sev, rx, desc, _contexts in _RULES_FOR_KIND.get(span.kind, TEXT_RULES):
+        if capped and sev == "block":
+            sev = "warn"
         for m in rx.finditer(seg):
-            add(m.start(), rid, cat, sev, desc, _excerpt(seg, m.start()))
-    if span.kind == "text":
-        rid, cat, sev = UNICODE_RULE
-        for idx, desc in hidden_unicode(seg):
+            add(m.start(), rid, cat, sev, desc, _excerpt(words, lo, hi, shift + m.start()))
+    if span.kind not in _RULES_FOR_KIND or span.kind == "unicode":  # every text kind
+        for idx, rid, desc in hidden_unicode(seg, span.start == 0 and not decoded):
+            cat, sev, _ = RULE_META[rid]
             add(idx, rid, cat, sev, desc, "")
 
 
 def _scan_spans(text: str, spans: list[Span], rel: str) -> list[Finding]:
     starts = _line_starts(text)
     out: list[Finding] = []
-    for span in spans:
-        _scan_span(text, span, starts, rel, out)
+    seen: set[tuple[int, str]] = set()
+    on_line: set[tuple[int, str]] = set()
+    secrets = Redactor(text)
+    # Capped spans go after the others, so a match also found by an uncapped span keeps its
+    # severity; spans with their own text go last, so the file's own offsets come first.
+    for span in sorted(spans, key=lambda s: (s.text is not None, s.kind in _WARN_CAPPED_KINDS)):
+        _scan_span(text, span, starts, rel, out, seen, on_line, secrets)
     return sort_findings(out)
 
 
-def scan_text(text: str, label: str = "<text>") -> ScanResult:
-    """Scan a raw string as both code and prose (used by the MCP server / --text)."""
+def scan_text(text: str, label: str = "<text>", context: str = "default",
+              max_chars: int = MAX_FILE_BYTES) -> ScanResult:
+    """Scan a raw string with the rules of `context` (rules.CONTEXTS) and the hidden-Unicode
+    check: "default" runs every code and text rule (--text, frisk-mcp); the proxy scans tool
+    descriptions as "tool_description" and what the model reads as "tool_result".
+
+    The one truncation policy for every caller: a text longer than `max_chars` has the rules
+    run on its first and last max_chars // 2 characters (lines count from the start of the
+    whole text), the hidden-Unicode check on all of it, and a coverage.truncated warning, so
+    the verdict is never PASS.
+    """
+    if context not in CONTEXTS:
+        raise ValueError(f"unknown scan_text context {context!r}; one of {CONTEXTS}")
+    kind = f"context:{context}"
     whole = len(text)
-    findings = _scan_spans(text, [Span(0, whole, "code"), Span(0, whole, "text")], label)
+    if whole <= max_chars:
+        findings = _scan_spans(text, [Span(0, whole, kind), Span(0, whole, "unicode")], label)
+    else:
+        half = max_chars // 2
+        windows = [Span(start, end, kind) for start, end in ((0, half), (whole - half, whole))]
+        findings = _scan_spans(text, windows + [Span(0, whole, "unicode")], label)
+        category, severity, _ = RULE_META["coverage.truncated"]
+        findings = sort_findings(findings + [Finding(
+            label, 1, "coverage.truncated", category, severity,
+            f"text of {whole} characters is over the {max_chars}-character limit: only its first and last "
+            f"{half} were pattern-matched (the hidden-Unicode check read it all)", "")])
     for f in findings:
         f.origin = "text"
     return ScanResult(findings)
 
 
+def coverage_warning(rel: str, rule: str, message: str) -> ScanResult:
+    """A coverage finding (a rule in RULE_META) about `rel` as a whole, at line 1."""
+    category, severity, _ = RULE_META[rule]
+    return ScanResult([Finding(rel, 1, rule, category, severity, message, "")])
+
+
 def _not_scanned(rel: str, reason: str, detail: str, rule: str | None = None,
                  message: str = "") -> ScanResult:
-    """A file that was not pattern-matched: a skipped entry, plus a warn finding if `rule`."""
-    findings = []
-    if rule is not None:
-        category, severity, _ = RULE_META[rule]
-        findings.append(Finding(rel, 1, rule, category, severity, message, ""))
-    return ScanResult(findings, Coverage(skipped=[Skipped(rel, reason, detail)]))
+    """A file that was not pattern-matched: a skipped entry, plus a `rule` finding if given."""
+    result = coverage_warning(rel, rule, message) if rule is not None else ScanResult()
+    result.coverage.skipped.append(Skipped(rel, reason, detail))
+    return result
 
 
-def _read_text(path: Path, rel: str) -> tuple[str | None, ScanResult]:
+# How much of a media-named file is read to tell real media from text saved under its name.
+MEDIA_SNIFF_BYTES = 1024
+
+
+def _text_head(path: Path) -> bool:
+    """Whether the file's first MEDIA_SNIFF_BYTES are text: not empty, no NUL byte, valid UTF-8
+    (a character cut at the end aside). Images, fonts, audio, video and PDFs fail this within
+    their first bytes; a script or instructions saved under a media name pass, and are scanned."""
+    with open(path, "rb") as fh:
+        head = fh.read(MEDIA_SNIFF_BYTES)
+    if not head or b"\0" in head:
+        return False
+    try:
+        codecs.getincrementaldecoder("utf-8")().decode(head, final=False)
+    except UnicodeDecodeError:
+        return False
+    return True
+
+
+def _read_text(path: Path, rel: str, max_bytes: int | None) -> tuple[str | None, ScanResult]:
     """The file's text (newlines normalised as text-mode reading does), plus coverage notes.
 
-    Text is None when the file cannot be pattern-matched at all. A text-like file that is
+    Text is None when the file cannot be pattern-matched at all, or is larger than
+    `max_bytes` (checked before reading). A text-like file that is
     not valid UTF-8 is still scanned, with undecodable bytes replaced, and also warns:
     one invalid byte must not hide the rest of the file.
     """
     ext = path.suffix.lower()
     if ext == ".":  # Python 3.14 reports 'name.' as suffix '.', 3.9 as '': no extension
         ext = ""
-    if ext in MEDIA_EXTS:
-        return None, _not_scanned(rel, "binary", ext)
     if ext in EXECUTABLE_EXTS:
         return None, _not_scanned(rel, "binary", ext, "coverage.binary",
                                   f"executable content not scanned ({ext})")
@@ -165,6 +269,18 @@ def _read_text(path: Path, rel: str) -> tuple[str | None, ScanResult]:
         return None, _not_scanned(rel, "binary", ext, "coverage.binary",
                                   f"archive not scanned: contents unscanned ({ext})")
     try:
+        st = os.lstat(path)  # never read through a symlink, never open a FIFO, socket or device
+        if stat.S_ISLNK(st.st_mode):
+            return None, _not_scanned(rel, "special", "symlink")
+        if not stat.S_ISREG(st.st_mode):
+            return None, _not_scanned(rel, "special", walk.special_kind(st.st_mode))
+        if ext in MEDIA_EXTS and not _text_head(path):  # real media: skipped silently, at any size
+            return None, _not_scanned(rel, "binary", ext)
+        size = st.st_size
+        if max_bytes is not None and size > max_bytes:
+            return None, _not_scanned(rel, "too_large", f"{size} bytes", "coverage.too_large",
+                                      f"file not scanned: {size} bytes is over the {max_bytes}-byte limit; "
+                                      f"raise --max-file-bytes to scan it, or leave it out of the target")
         data = path.read_bytes()
     except OSError as e:
         name = type(e).__name__
@@ -201,9 +317,10 @@ def _in_target(path: Path, root: Path | None) -> str:
     return (path.relative_to(root) if root else path).as_posix()
 
 
-def scan_file(path: Path, root: Path | None = None) -> ScanResult:
+def scan_file(path: Path, root: Path | None = None, max_bytes: int | None = None) -> ScanResult:
+    """Scan one file; one larger than `max_bytes` (None: no bound) is not read."""
     rel = _in_target(path, root)
-    text, notes = _read_text(path, rel)
+    text, notes = _read_text(path, rel, max_bytes)
     if text is None:
         return notes
     failed: dict[str, None] = {}  # surface failures, in order, reported once per file
@@ -211,10 +328,19 @@ def scan_file(path: Path, root: Path | None = None) -> ScanResult:
     if "\0" in text:
         # NUL bytes make two readings: as written (a renderer shows NUL as U+FFFD, so it
         # cannot close a fence) and with NUL dropped (shells drop it, so 'c<NUL>url' runs as
-        # 'curl'). A finding from either reading counts, once.
-        seen = {(f.line, f.rule, f.description) for f in findings}
-        findings += [f for f in _scan_reading(path, text.replace("\0", ""), rel, failed)
-                     if (f.line, f.rule, f.description) not in seen]
+        # 'curl'). A finding from either reading counts, once, at the higher of its two
+        # severities: one reading may see as capped inline code what the other sees as a
+        # code block.
+        first: dict[tuple[int, str, str], list[Finding]] = {}
+        for f in findings:
+            first.setdefault((f.line, f.rule, f.description), []).append(f)
+        for f in _scan_reading(path, text.replace("\0", ""), rel, failed):
+            same = first.get((f.line, f.rule, f.description))
+            if same is None:
+                findings.append(f)
+                continue
+            for g in same:
+                g.severity = max(g.severity, f.severity, key=SEVERITY_ORDER.__getitem__)
     for detail in failed:
         notes.extend(_not_scanned(rel, "surface_error", detail, "coverage.surface_error",
                                   f"scan surface failed on this file ({detail})"))
@@ -234,34 +360,154 @@ def _scan_reading(path: Path, text: str, rel: str, failed: dict[str, None]) -> l
     return _scan_spans(text, spans, rel)
 
 
-def scan_path(path: str | Path, root: Path | None = None) -> ScanResult:
+def scan_path(path: str | Path, root: Path | None = None, limits: ScanLimits | None = None) -> ScanResult:
+    """Scan a file or a directory tree within `limits` (default: ScanLimits()).
+
+    Nothing outside the scan root is read: a symlink (also a single-file target that is
+    one) whose target lies outside it is an fs.symlink_escape finding, never opened."""
+    limits = limits or ScanLimits()
     p = Path(path)
-    if p.is_file():
-        return scan_file(p, root or p.parent)
+    if os.path.islink(p) and not p.is_dir():  # a symlinked directory named as the target is walked
+        base = root or p.parent
+        return _link(p, base, Path(os.path.realpath(base)), limits.max_file_bytes, set())[0].sort()
+    if p.is_file() or (p.exists() and not p.is_dir()):  # a FIFO, socket or device: skipped as special
+        return scan_file(p, root or p.parent, limits.max_file_bytes)
     result = ScanResult()
     base = root or p
-    _check_listable(p, base, result)
-    for f in sorted(p.rglob("*")):
-        inside = f.relative_to(p).parts
-        if ".git" in inside and not (inside[-1] == ".git" and f.is_file()):  # a gitfile is scanned
-            if inside.index(".git") == len(inside) - 1:  # the VCS directory itself, once
-                rel = _in_target(f, base)
-                if len(inside) > 1 and f.is_dir():
-                    # Below the top, a .git directory is an easy hiding place: warn.
-                    result.extend(_not_scanned(rel, "vcs_dir", "nested", "coverage.nested_vcs",
-                                               "nested .git directory not scanned"))
-                else:
-                    result.coverage.skipped.append(Skipped(rel, "vcs_dir"))
-            continue
-        if f.is_file():
-            result.extend(scan_file(f, base))
-        elif f.is_dir():
-            _check_listable(f, base, result)
+    stopped = _walk(p, base, limits, result)
+    # Skipped entries in the order a sorted listing of the whole tree gives (a directory
+    # before what is in it), whatever order the walk met them in.
+    result.coverage.skipped.sort(key=lambda s: s.path.split("/"))
+    if stopped is not None:
+        reason, detail, message = stopped
+        result.extend(_not_scanned(_in_target(p, base), reason, detail, "coverage.unscanned", message))
     return result.sort()
 
 
+def scan_target(target: str, limits: ScanLimits | None = None) -> ScanResult:
+    """Scan a local path or a git URL (cloned to a temp dir, removed afterwards) within
+    `limits`; paths are relative to the target, as scan_path reports them."""
+    with materialize(target) as (root, _label):
+        return scan_path(root, limits=limits)
+
+
+def _walk(top: Path, base: Path, limits: ScanLimits, result: ScanResult) -> tuple[str, str, str] | None:
+    """Scan the files below `top` into `result` (walk.entries: name order, no symlink
+    followed, no .git directory entered). A symlink to a file inside the root is scanned
+    once, at the target's path. Returns (reason, detail, message) for the limit that
+    stopped the walk, or None when it went through the tree."""
+    started = time.monotonic()
+    looked_at = read = 0
+    base_real = Path(os.path.realpath(base))
+    scanned: set[str] = set()  # in-target paths already read, so a linked file is read once
+
+    def unlistable(err: OSError) -> None:
+        name = type(err).__name__
+        where = Path(err.filename) if err.filename is not None else top
+        result.extend(_not_scanned(_in_target(where, base), "unreadable", name, "coverage.unreadable",
+                                   f"directory could not be listed: {name}"))
+
+    for entry in walk.entries(top, onerror=unlistable):
+        if entry.kind == "dir":
+            if limits.deadline_s is not None and time.monotonic() - started >= limits.deadline_s:
+                return _limit_hit(limits, looked_at, read, started)  # also between directories with no files
+            continue
+        if entry.kind == "vcs":
+            _vcs_dir(entry.path, base, nested=entry.nested, result=result)
+            continue
+        if entry.kind == "dir_link":  # listed as an entry, never entered
+            link = walk.read_link(entry.path, base_real)
+            if link.inside:
+                _check_listable(entry.path, base, result)
+            else:
+                result.extend(_escape(_in_target(entry.path, base), link))
+            continue
+        if entry.kind == "special":
+            result.coverage.skipped.append(Skipped(_in_target(entry.path, base), "special", entry.detail))
+            continue
+        hit = _limit_hit(limits, looked_at, read, started)
+        if hit is not None:
+            return hit
+        if entry.kind == "link":
+            found, target = _link(entry.path, base, base_real, limits.max_file_bytes, scanned)
+        elif _in_target(entry.path, base) in scanned:  # already read through a link to it
+            continue
+        else:
+            target = entry.path
+            scanned.add(_in_target(target, base))
+            found = scan_file(target, base, limits.max_file_bytes)
+        looked_at += 1
+        if found.coverage.files_scanned and target is not None:
+            read += _size(target)
+        result.extend(found)
+    return None
+
+
+def _size(path: Path) -> int:
+    try:
+        return os.lstat(path).st_size
+    except OSError:  # gone since it was read: counts as nothing
+        return 0
+
+
+def _link(link_path: Path, base: Path, base_real: Path, max_bytes: int | None,
+          scanned: set[str]) -> tuple[ScanResult, Path | None]:
+    """A symlink that is not to a directory, and the file read for it (None: none).
+    Outside the root: an fs.symlink_escape finding, never read. Inside: the target is
+    scanned at its own path, once (`scanned`); a link that loops is skipped as 'loop', a
+    dangling one as before (nothing to read)."""
+    link = walk.read_link(link_path, base_real)
+    rel = _in_target(link_path, base)
+    if not link.inside:
+        return _escape(rel, link), None
+    if walk.is_loop(link_path):
+        return _not_scanned(rel, "loop", link.text), None
+    if not link.real.exists():
+        log.debug("entry skipped (dangling symlink)")
+        return ScanResult(), None
+    target = base / link.real.relative_to(base_real)
+    where = _in_target(target, base)
+    if where in scanned:
+        return ScanResult(), None
+    scanned.add(where)
+    return scan_file(target, base, max_bytes), target
+
+
+def _escape(rel: str, link: walk.Link) -> ScanResult:
+    """The fs.symlink_escape finding for a link out of the root: paths only, no excerpt."""
+    category, _, _ = RULE_META["fs.symlink_escape"]
+    severity = "block" if link.credential else "warn"
+    where = "a credential location" if link.credential else "outside the scanned tree"
+    result = ScanResult([Finding(rel, 1, "fs.symlink_escape", category, severity,
+                                 f"symlink {rel} points {where} ({link.text}); not read", "")])
+    result.coverage.skipped.append(Skipped(rel, "symlink_escape", link.text))
+    return result
+
+
+def _limit_hit(limits: ScanLimits, looked_at: int, read: int, started: float) -> tuple[str, str, str] | None:
+    rest = "the rest of the tree was not scanned"
+    if limits.deadline_s is not None and time.monotonic() - started >= limits.deadline_s:
+        return "deadline", f"{limits.deadline_s:g} s", f"scan stopped after {limits.deadline_s:g} s: {rest}"
+    if looked_at >= limits.max_files:
+        return "file_cap", f"{limits.max_files} files", f"scan stopped after {limits.max_files} files: {rest}"
+    if limits.max_bytes is not None and read >= limits.max_bytes:
+        return "byte_cap", f"{limits.max_bytes} bytes", f"scan stopped after reading {limits.max_bytes} bytes: {rest}"
+    return None
+
+
+def _vcs_dir(entry: Path, base: Path, nested: bool, result: ScanResult) -> None:
+    """A .git entry that is not a file: not scanned. A directory below the top warns."""
+    rel = _in_target(entry, base)
+    if nested and entry.is_dir():
+        # Below the top, a .git directory is an easy hiding place: warn.
+        result.extend(_not_scanned(rel, "vcs_dir", "nested", "coverage.nested_vcs",
+                                   "nested .git directory not scanned"))
+    else:
+        result.coverage.skipped.append(Skipped(rel, "vcs_dir"))
+
+
 def _check_listable(directory: Path, base: Path, result: ScanResult) -> None:
-    """rglob silently skips a directory it cannot list; record it as unreadable instead."""
+    """A symlinked directory is not walked into; one that cannot be listed is recorded as unreadable."""
     try:
         with os.scandir(directory):
             pass
@@ -309,6 +555,13 @@ def _join(prefix: str, path: str) -> str:
     if path == "." and prefix.endswith("/"):
         return prefix.rstrip("/") or "/"
     return prefix + path
+
+
+def counts(findings: list[Finding]) -> dict[str, int]:
+    """{"block": n, "warn": n, "total": n}: how many findings there are at each severity."""
+    return {"block": sum(1 for f in findings if f.severity == "block"),
+            "warn": sum(1 for f in findings if f.severity == "warn"),
+            "total": len(findings)}
 
 
 def worst_severity(findings: list[Finding]) -> str | None:
